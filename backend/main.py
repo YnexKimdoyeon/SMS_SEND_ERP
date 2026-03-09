@@ -22,7 +22,10 @@ app = FastAPI(title="입금 알림 문자 발송 시스템")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=[
+        "http://localhost:3000",
+        "https://ynex3.mycafe24.com",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
