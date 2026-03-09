@@ -110,6 +110,7 @@ function Calendar({
 function StatCard({ label, value, sub, color }: { label: string; value: string; sub?: string; color: string }) {
   const colors: Record<string, string> = {
     blue: "from-blue-500 to-blue-600",
+    orange: "from-amber-500 to-orange-600",
     green: "from-emerald-500 to-emerald-600",
     red: "from-rose-500 to-rose-600",
     purple: "from-violet-500 to-violet-600",
@@ -318,8 +319,9 @@ export default function Home() {
           {/* ===== DASHBOARD ===== */}
           {tab === "dashboard" && dashboard && (
             <div className="space-y-6">
-              <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+              <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
                 <StatCard label="등록 사용자" value={`${dashboard.user_count}명`} color="purple" />
+                <StatCard label="오늘 받을 금액" value={`${formatAmount(dashboard.today_amount)}원`} sub={`${dashboard.today_count}건`} color="orange" />
                 <StatCard label="총 입금 예정" value={`${dashboard.total_count}건`} sub={`${formatAmount(dashboard.total_amount)}원`} color="blue" />
                 <StatCard label="입금 완료" value={`${dashboard.paid_count}건`} sub={`${formatAmount(dashboard.paid_amount)}원`} color="green" />
                 <StatCard label="미입금" value={`${dashboard.unpaid_count}건`} sub={`${formatAmount(dashboard.unpaid_amount)}원`} color="red" />

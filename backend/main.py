@@ -336,6 +336,12 @@ def get_dashboard(year: Optional[int] = None, month: Optional[int] = None, db: S
     unpaid_amount = total_amount - paid_amount
     sms_sent_count = sum(1 for p in payments if p.sms_sent)
 
+    # 오늘 받아야 할 금액
+    today = date.today()
+    today_payments = [p for p in payments if p.due_date == today and not p.is_paid]
+    today_count = len(today_payments)
+    today_amount = sum(p.amount for p in today_payments)
+
     user_count = db.query(func.count(User.id)).scalar()
 
     # 최근 문자 발송 5건
@@ -356,6 +362,8 @@ def get_dashboard(year: Optional[int] = None, month: Optional[int] = None, db: S
         "unpaid_count": unpaid_count,
         "unpaid_amount": unpaid_amount,
         "sms_sent_count": sms_sent_count,
+        "today_count": today_count,
+        "today_amount": today_amount,
         "user_count": user_count,
         "recent_logs": [
             {

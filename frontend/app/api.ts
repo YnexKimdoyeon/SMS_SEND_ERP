@@ -39,6 +39,8 @@ export interface Dashboard {
   unpaid_count: number;
   unpaid_amount: number;
   sms_sent_count: number;
+  today_count: number;
+  today_amount: number;
   user_count: number;
   recent_logs: { user_name: string; status: string; sent_at: string }[];
 }
