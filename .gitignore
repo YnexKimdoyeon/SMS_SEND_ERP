@@ -4,5 +4,10 @@ __pycache__/
 venv/
 .env
 .env.local
+.env.production
 payment.db
+*.db
 .next/
+out/
+*.log
+logs/

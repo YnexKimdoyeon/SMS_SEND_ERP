@@ -9,7 +9,14 @@
       "Bash(printf \\\\xEF\\\\xBB\\\\xBF:*)",
       "Bash(npx prisma:*)",
       "Bash(mkdir:*)",
-      "Bash(rm:*)"
+      "Bash(rm:*)",
+      "Bash(find \"C:\\\\Users\\\\Doyeon\\\\Desktop\\\\원설 문자 프로젝트\" -type f \\\\\\( -name \"*.py\" -o -name \"*.js\" -o -name \"*.ts\" \\\\\\) 2>/dev/null | head -100)",
+      "Bash(find \"C:\\\\Users\\\\Doyeon\\\\Desktop\\\\원설 문자 프로젝트\" -name \"*.py\" -type f 2>/dev/null | grep -v __pycache__)",
+      "Bash(cd \"C:\\\\Users\\\\Doyeon\\\\Desktop\\\\원설 문자 프로젝트\" && python3 -c \"from apscheduler.schedulers.background import BackgroundScheduler; help\\(BackgroundScheduler.add_job\\)\" 2>&1 | head -50)",
+      "Bash(cd \"C:\\\\Users\\\\Doyeon\\\\Desktop\\\\원설 문자 프로젝트\\\\backend\" && python3 -c \"import main; import inspect; print\\([name for name, obj in inspect.getmembers\\(main.app.routes\\) if hasattr\\(obj, 'path'\\)]\\)\" 2>&1)",
+      "Bash(cd \"C:\\\\Users\\\\Doyeon\\\\Desktop\\\\원설 문자 프로젝트\" && python3 << 'EOF'\nimport sys\nsys.path.insert\\(0, './backend'\\)\nfrom main import app\nfor route in app.routes:\n    print\\(f\"{route.path} - {route.methods if hasattr\\(route, 'methods'\\) else 'N/A'}\"\\)\nEOF)",
+      "Bash(grep -E '\\\\.\\(json|ts|js\\)$')",
+      "Bash(npm run:*)"
     ]
   }
 }

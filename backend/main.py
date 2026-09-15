@@ -1,14 +1,22 @@
-from fastapi import FastAPI, Depends, HTTPException
+import secrets
+import hashlib
+import time
+from collections import defaultdict
+from fastapi import FastAPI, Depends, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-from pydantic import BaseModel
-from datetime import date, datetime
+from pydantic import BaseModel, Field, field_validator
+from datetime import date, datetime, timedelta
 from typing import Optional
-import requests
+import requests as http_requests
 import os
 import io
+import re
+import jwt
 from dotenv import load_dotenv
 
 from database import engine, get_db, Base
@@ -18,25 +26,233 @@ load_dotenv()
 
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="입금 알림 문자 발송 시스템")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "https://ynex3.mycafe24.com",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+# ==========================================
+# 보안 설정 검증 - 시작 시 체크
+# ==========================================
+
+JWT_SECRET = os.getenv("JWT_SECRET_KEY", "")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRATION_HOURS = 12  # 24h → 12h로 단축
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
+
+if not JWT_SECRET or len(JWT_SECRET) < 32:
+    raise RuntimeError(
+        "[보안 오류] JWT_SECRET_KEY가 설정되지 않았거나 32자 미만입니다. "
+        ".env 파일에 최소 32자 이상의 랜덤 문자열을 설정하세요."
+    )
+
+if not ADMIN_PASSWORD or len(ADMIN_PASSWORD) < 10:
+    raise RuntimeError(
+        "[보안 오류] ADMIN_PASSWORD가 설정되지 않았거나 10자 미만입니다. "
+        ".env 파일에 강력한 비밀번호를 설정하세요."
+    )
+
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("ALLOWED_ORIGINS", "https://ynex3.mycafe24.com").split(",")
+    if origin.strip()
+]
+
+
+# ==========================================
+# FastAPI 앱 생성 (Swagger 문서 비활성화)
+# ==========================================
+
+app = FastAPI(
+    title="입금 알림 문자 발송 시스템",
+    docs_url=None,      # /docs 비활성화
+    redoc_url=None,     # /redoc 비활성화
+    openapi_url=None,   # /openapi.json 비활성화
 )
 
 
-# === Schemas ===
+# ==========================================
+# 보안 미들웨어
+# ==========================================
+
+# 허용된 호스트만 접근 가능
+ALLOWED_HOSTS = [
+    h.strip()
+    for h in os.getenv("ALLOWED_HOSTS", "ynex3.mycafe24.com,localhost").split(",")
+    if h.strip()
+]
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
+
+# CORS 최소 권한
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_headers=["Authorization", "Content-Type"],
+)
+
+
+# 보안 헤더 미들웨어
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    # 민감한 서버 정보 숨기기
+    if "server" in response.headers:
+        del response.headers["server"]
+    return response
+
+
+# ==========================================
+# 로그인 Rate Limiting (IP 기반)
+# ==========================================
+
+class LoginRateLimiter:
+    """IP별 로그인 시도 제한 - 5회 실패 시 5분 차단"""
+
+    def __init__(self, max_attempts: int = 5, lockout_seconds: int = 300):
+        self.max_attempts = max_attempts
+        self.lockout_seconds = lockout_seconds
+        self._attempts: dict[str, list[float]] = defaultdict(list)
+        self._locked_until: dict[str, float] = {}
+
+    def _clean_old(self, ip: str):
+        now = time.time()
+        self._attempts[ip] = [
+            t for t in self._attempts[ip]
+            if now - t < self.lockout_seconds
+        ]
+
+    def is_locked(self, ip: str) -> bool:
+        until = self._locked_until.get(ip, 0)
+        if time.time() < until:
+            return True
+        if until > 0:
+            del self._locked_until[ip]
+            self._attempts[ip] = []
+        return False
+
+    def record_failure(self, ip: str):
+        self._clean_old(ip)
+        self._attempts[ip].append(time.time())
+        if len(self._attempts[ip]) >= self.max_attempts:
+            self._locked_until[ip] = time.time() + self.lockout_seconds
+
+    def record_success(self, ip: str):
+        self._attempts.pop(ip, None)
+        self._locked_until.pop(ip, None)
+
+    def remaining_lockout(self, ip: str) -> int:
+        until = self._locked_until.get(ip, 0)
+        remaining = until - time.time()
+        return max(0, int(remaining))
+
+
+login_limiter = LoginRateLimiter()
+
+
+# ==========================================
+# Auth
+# ==========================================
+
+security = HTTPBearer()
+
+
+def _get_client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def create_token() -> str:
+    payload = {
+        "sub": "admin",
+        "exp": datetime.utcnow() + timedelta(hours=JWT_EXPIRATION_HOURS),
+        "iat": datetime.utcnow(),
+        "jti": secrets.token_hex(16),  # 토큰 고유 ID
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
+    try:
+        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        return payload["sub"]
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="토큰이 만료되었습니다. 다시 로그인하세요.")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="유효하지 않은 토큰입니다.")
+
+
+def _constant_time_compare(a: str, b: str) -> bool:
+    """타이밍 공격 방지용 비교"""
+    return secrets.compare_digest(a.encode(), b.encode())
+
+
+class LoginRequest(BaseModel):
+    password: str = Field(..., min_length=1, max_length=128)
+
+
+@app.post("/api/auth/login")
+def login(data: LoginRequest, request: Request):
+    ip = _get_client_ip(request)
+
+    if login_limiter.is_locked(ip):
+        remaining = login_limiter.remaining_lockout(ip)
+        raise HTTPException(
+            status_code=429,
+            detail=f"너무 많은 로그인 시도입니다. {remaining}초 후에 다시 시도하세요.",
+        )
+
+    if not _constant_time_compare(data.password, ADMIN_PASSWORD):
+        login_limiter.record_failure(ip)
+        # 의도적으로 모호한 에러 메시지
+        raise HTTPException(status_code=401, detail="인증에 실패했습니다.")
+
+    login_limiter.record_success(ip)
+    token = create_token()
+    return {"token": token, "message": "로그인 성공"}
+
+
+@app.get("/api/auth/verify")
+def verify_auth(user: str = Depends(verify_token)):
+    return {"valid": True}
+
+
+# ==========================================
+# Schemas (입력 검증 강화)
+# ==========================================
+
+PHONE_REGEX = re.compile(r"^01[016789]\d{7,8}$")
+
 
 class UserCreate(BaseModel):
-    name: str
-    phone: str
+    name: str = Field(..., min_length=1, max_length=50)
+    phone: str = Field(..., min_length=10, max_length=11)
+
+    @field_validator("name")
+    @classmethod
+    def sanitize_name(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("이름을 입력하세요")
+        # HTML/스크립트 태그 제거
+        if re.search(r"[<>&\"']", v):
+            raise ValueError("이름에 특수문자를 사용할 수 없습니다")
+        return v
+
+    @field_validator("phone")
+    @classmethod
+    def validate_phone(cls, v: str) -> str:
+        v = v.strip().replace("-", "").replace(" ", "")
+        if not PHONE_REGEX.match(v):
+            raise ValueError("올바른 전화번호 형식이 아닙니다 (예: 01012345678)")
+        return v
+
 
 class UserResponse(BaseModel):
     id: int
@@ -47,17 +263,28 @@ class UserResponse(BaseModel):
     class Config:
         from_attributes = True
 
+
 class PaymentCreate(BaseModel):
-    user_id: int
+    user_id: int = Field(..., gt=0)
     due_date: date
-    amount: int
-    memo: str = ""
+    amount: int = Field(..., gt=0, le=100_000_000)  # 최대 1억
+    memo: str = Field("", max_length=200)
+
+    @field_validator("memo")
+    @classmethod
+    def sanitize_memo(cls, v: str) -> str:
+        v = v.strip()
+        if re.search(r"[<>]", v):
+            raise ValueError("메모에 < > 문자를 사용할 수 없습니다")
+        return v
+
 
 class PaymentUpdate(BaseModel):
     is_paid: Optional[bool] = None
     due_date: Optional[date] = None
-    amount: Optional[int] = None
-    memo: Optional[str] = None
+    amount: Optional[int] = Field(None, gt=0, le=100_000_000)
+    memo: Optional[str] = Field(None, max_length=200)
+
 
 class PaymentResponse(BaseModel):
     id: int
@@ -73,12 +300,15 @@ class PaymentResponse(BaseModel):
     class Config:
         from_attributes = True
 
+
 class SMSSend(BaseModel):
-    payment_id: int
-    message: Optional[str] = None
+    payment_id: int = Field(..., gt=0)
+    message: Optional[str] = Field(None, max_length=2000)
 
 
-# === Helper: SMS 발송 + 로그 기록 ===
+# ==========================================
+# Helper: SMS 발송 + 로그 기록
+# ==========================================
 
 def _send_sms_and_log(payment: Payment, msg: str, db: Session) -> bool:
     """문자 발송 후 로그 기록. 성공 시 True 반환."""
@@ -96,7 +326,7 @@ def _send_sms_and_log(payment: Payment, msg: str, db: Session) -> bool:
         return False
 
     try:
-        response = requests.post(
+        response = http_requests.post(
             "https://apis.aligo.in/send/",
             data={
                 "key": api_key,
@@ -107,6 +337,7 @@ def _send_sms_and_log(payment: Payment, msg: str, db: Session) -> bool:
                 "msg_type": "LMS" if len(msg.encode("utf-8")) > 90 else "SMS",
                 "title": "입금 안내" if len(msg.encode("utf-8")) > 90 else "",
             },
+            timeout=10,  # 타임아웃 설정
         )
         result = response.json()
 
@@ -127,7 +358,7 @@ def _send_sms_and_log(payment: Payment, msg: str, db: Session) -> bool:
             ))
             db.commit()
             return False
-    except requests.RequestException as e:
+    except http_requests.RequestException as e:
         db.add(SmsLog(
             payment_id=payment.id, user_name=payment.user.name,
             phone=payment.user.phone, message=msg,
@@ -137,22 +368,26 @@ def _send_sms_and_log(payment: Payment, msg: str, db: Session) -> bool:
         return False
 
 
-# === User Endpoints ===
+# ==========================================
+# User Endpoints
+# ==========================================
 
 @app.get("/api/users", response_model=list[UserResponse])
-def get_users(db: Session = Depends(get_db)):
+def get_users(db: Session = Depends(get_db), _user: str = Depends(verify_token)):
     return db.query(User).order_by(User.name).all()
 
+
 @app.post("/api/users", response_model=UserResponse)
-def create_user(user: UserCreate, db: Session = Depends(get_db)):
+def create_user(user: UserCreate, db: Session = Depends(get_db), _user: str = Depends(verify_token)):
     db_user = User(name=user.name, phone=user.phone)
     db.add(db_user)
     db.commit()
     db.refresh(db_user)
     return db_user
 
+
 @app.put("/api/users/{user_id}", response_model=UserResponse)
-def update_user(user_id: int, user: UserCreate, db: Session = Depends(get_db)):
+def update_user(user_id: int, user: UserCreate, db: Session = Depends(get_db), _user: str = Depends(verify_token)):
     db_user = db.query(User).filter(User.id == user_id).first()
     if not db_user:
         raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다")
@@ -162,8 +397,9 @@ def update_user(user_id: int, user: UserCreate, db: Session = Depends(get_db)):
     db.refresh(db_user)
     return db_user
 
+
 @app.delete("/api/users/{user_id}")
-def delete_user(user_id: int, db: Session = Depends(get_db)):
+def delete_user(user_id: int, db: Session = Depends(get_db), _user: str = Depends(verify_token)):
     db_user = db.query(User).filter(User.id == user_id).first()
     if not db_user:
         raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다")
@@ -172,14 +408,24 @@ def delete_user(user_id: int, db: Session = Depends(get_db)):
     return {"message": "삭제 완료"}
 
 
-# === Payment Endpoints ===
+# ==========================================
+# Payment Endpoints
+# ==========================================
 
 @app.get("/api/payments", response_model=list[PaymentResponse])
-def get_payments(year: Optional[int] = None, month: Optional[int] = None, user_id: Optional[int] = None, db: Session = Depends(get_db)):
+def get_payments(
+    year: Optional[int] = None,
+    month: Optional[int] = None,
+    user_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+    _user: str = Depends(verify_token),
+):
     query = db.query(Payment)
     if user_id:
         query = query.filter(Payment.user_id == user_id)
     if year and month:
+        if not (2000 <= year <= 2100 and 1 <= month <= 12):
+            raise HTTPException(status_code=400, detail="올바른 년/월을 입력하세요")
         start = date(year, month, 1)
         if month == 12:
             end = date(year + 1, 1, 1)
@@ -188,8 +434,9 @@ def get_payments(year: Optional[int] = None, month: Optional[int] = None, user_i
         query = query.filter(Payment.due_date >= start, Payment.due_date < end)
     return query.order_by(Payment.due_date).all()
 
+
 @app.post("/api/payments", response_model=PaymentResponse)
-def create_payment(payment: PaymentCreate, db: Session = Depends(get_db)):
+def create_payment(payment: PaymentCreate, db: Session = Depends(get_db), _user: str = Depends(verify_token)):
     user = db.query(User).filter(User.id == payment.user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다")
@@ -204,8 +451,9 @@ def create_payment(payment: PaymentCreate, db: Session = Depends(get_db)):
     db.refresh(db_payment)
     return db_payment
 
+
 @app.put("/api/payments/{payment_id}", response_model=PaymentResponse)
-def update_payment(payment_id: int, payment: PaymentUpdate, db: Session = Depends(get_db)):
+def update_payment(payment_id: int, payment: PaymentUpdate, db: Session = Depends(get_db), _user: str = Depends(verify_token)):
     db_payment = db.query(Payment).filter(Payment.id == payment_id).first()
     if not db_payment:
         raise HTTPException(status_code=404, detail="입금 정보를 찾을 수 없습니다")
@@ -221,8 +469,9 @@ def update_payment(payment_id: int, payment: PaymentUpdate, db: Session = Depend
     db.refresh(db_payment)
     return db_payment
 
+
 @app.delete("/api/payments/{payment_id}")
-def delete_payment(payment_id: int, db: Session = Depends(get_db)):
+def delete_payment(payment_id: int, db: Session = Depends(get_db), _user: str = Depends(verify_token)):
     db_payment = db.query(Payment).filter(Payment.id == payment_id).first()
     if not db_payment:
         raise HTTPException(status_code=404, detail="입금 정보를 찾을 수 없습니다")
@@ -231,10 +480,12 @@ def delete_payment(payment_id: int, db: Session = Depends(get_db)):
     return {"message": "삭제 완료"}
 
 
-# === SMS Endpoints ===
+# ==========================================
+# SMS Endpoints
+# ==========================================
 
 @app.post("/api/sms/send")
-def send_sms(data: SMSSend, db: Session = Depends(get_db)):
+def send_sms(data: SMSSend, db: Session = Depends(get_db), _user: str = Depends(verify_token)):
     payment = db.query(Payment).filter(Payment.id == data.payment_id).first()
     if not payment:
         raise HTTPException(status_code=404, detail="입금 정보를 찾을 수 없습니다")
@@ -258,7 +509,7 @@ def send_sms(data: SMSSend, db: Session = Depends(get_db)):
 
 
 @app.post("/api/sms/send-bulk")
-def send_bulk_sms(db: Session = Depends(get_db)):
+def send_bulk_sms(db: Session = Depends(get_db), _user: str = Depends(verify_token)):
     payments = (
         db.query(Payment)
         .filter(Payment.is_paid == False, Payment.sms_sent == False)
@@ -282,10 +533,22 @@ def send_bulk_sms(db: Session = Depends(get_db)):
     return {"message": f"{sent_count}건 발송 완료", "sent": sent_count}
 
 
-# === SMS 발송 이력 ===
+# ==========================================
+# SMS 발송 이력
+# ==========================================
 
 @app.get("/api/sms/logs")
-def get_sms_logs(page: int = 1, size: int = 50, db: Session = Depends(get_db)):
+def get_sms_logs(
+    page: int = 1,
+    size: int = 50,
+    db: Session = Depends(get_db),
+    _user: str = Depends(verify_token),
+):
+    if page < 1:
+        page = 1
+    if size > 100:
+        size = 100  # 최대 페이지 크기 제한
+
     total = db.query(func.count(SmsLog.id)).scalar()
     logs = (
         db.query(SmsLog)
@@ -313,13 +576,23 @@ def get_sms_logs(page: int = 1, size: int = 50, db: Session = Depends(get_db)):
     }
 
 
-# === 대시보드 ===
+# ==========================================
+# 대시보드
+# ==========================================
 
 @app.get("/api/dashboard")
-def get_dashboard(year: Optional[int] = None, month: Optional[int] = None, db: Session = Depends(get_db)):
+def get_dashboard(
+    year: Optional[int] = None,
+    month: Optional[int] = None,
+    db: Session = Depends(get_db),
+    _user: str = Depends(verify_token),
+):
     if not year or not month:
         today = date.today()
         year, month = today.year, today.month
+
+    if not (2000 <= year <= 2100 and 1 <= month <= 12):
+        raise HTTPException(status_code=400, detail="올바른 년/월을 입력하세요")
 
     start = date(year, month, 1)
     end = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
@@ -336,7 +609,6 @@ def get_dashboard(year: Optional[int] = None, month: Optional[int] = None, db: S
     unpaid_amount = total_amount - paid_amount
     sms_sent_count = sum(1 for p in payments if p.sms_sent)
 
-    # 오늘 받아야 할 금액
     today = date.today()
     today_payments = [p for p in payments if p.due_date == today and not p.is_paid]
     today_count = len(today_payments)
@@ -344,7 +616,6 @@ def get_dashboard(year: Optional[int] = None, month: Optional[int] = None, db: S
 
     user_count = db.query(func.count(User.id)).scalar()
 
-    # 최근 문자 발송 5건
     recent_logs = (
         db.query(SmsLog)
         .order_by(SmsLog.sent_at.desc())
@@ -376,16 +647,34 @@ def get_dashboard(year: Optional[int] = None, month: Optional[int] = None, db: S
     }
 
 
-# === 엑셀 다운로드 ===
+# ==========================================
+# 엑셀 다운로드 (토큰을 헤더로 검증)
+# ==========================================
 
 @app.get("/api/export/excel")
-def export_excel(year: Optional[int] = None, month: Optional[int] = None, db: Session = Depends(get_db)):
+def export_excel(
+    year: Optional[int] = None,
+    month: Optional[int] = None,
+    token: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    # 엑셀 다운로드는 <a> 태그로 호출되므로 쿼리 파라미터로 토큰 검증
+    if not token:
+        raise HTTPException(status_code=401, detail="인증이 필요합니다.")
+    try:
+        jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="유효하지 않은 토큰입니다.")
+
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
     if not year or not month:
         today = date.today()
         year, month = today.year, today.month
+
+    if not (2000 <= year <= 2100 and 1 <= month <= 12):
+        raise HTTPException(status_code=400, detail="올바른 년/월을 입력하세요")
 
     start = date(year, month, 1)
     end = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
@@ -446,7 +735,6 @@ def export_excel(year: Optional[int] = None, month: Optional[int] = None, db: Se
             elif col in (1, 7, 8):
                 cell.alignment = Alignment(horizontal="center")
 
-    # 합계 행
     total_row = len(payments) + 2
     ws.cell(row=total_row, column=4, value="합계").font = Font(bold=True)
     ws.cell(row=total_row, column=5, value=sum(p.amount for p in payments)).font = Font(bold=True)
@@ -510,15 +798,18 @@ def export_excel(year: Optional[int] = None, month: Optional[int] = None, db: Se
     )
 
 
-# === 설정 API ===
+# ==========================================
+# 설정 API
+# ==========================================
 
 @app.get("/api/settings/send-time")
-def get_send_time(db: Session = Depends(get_db)):
+def get_send_time(db: Session = Depends(get_db), _user: str = Depends(verify_token)):
     setting = db.query(Setting).filter(Setting.key == "send_time").first()
     return {"send_time": setting.value if setting else "09:00"}
 
+
 @app.put("/api/settings/send-time")
-def update_send_time(data: dict, db: Session = Depends(get_db)):
+def update_send_time(data: dict, db: Session = Depends(get_db), _user: str = Depends(verify_token)):
     time_str = data.get("send_time", "09:00")
     try:
         h, m = map(int, time_str.split(":"))
@@ -538,9 +829,21 @@ def update_send_time(data: dict, db: Session = Depends(get_db)):
     return {"message": f"발송 시간이 {time_str}으로 설정되었습니다", "send_time": time_str}
 
 
-# === 스케줄러 ===
+# ==========================================
+# 헬스체크 (인증 불필요 - 모니터링용)
+# ==========================================
+
+@app.get("/api/health")
+def health_check():
+    return {"status": "ok"}
+
+
+# ==========================================
+# 스케줄러
+# ==========================================
 
 from apscheduler.schedulers.background import BackgroundScheduler
+
 
 def auto_send_daily():
     db = next(get_db())
@@ -566,12 +869,15 @@ def auto_send_daily():
     finally:
         db.close()
 
+
 scheduler = BackgroundScheduler()
+
 
 def reschedule_job(hour: int, minute: int):
     if scheduler.get_job("daily_sms"):
         scheduler.remove_job("daily_sms")
     scheduler.add_job(auto_send_daily, "cron", hour=hour, minute=minute, id="daily_sms")
+
 
 def init_scheduler():
     db = next(get_db())
@@ -584,9 +890,10 @@ def init_scheduler():
         db.close()
     scheduler.start()
 
+
 init_scheduler()
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="127.0.0.1", port=8000)

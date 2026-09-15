@@ -1,4 +1,4 @@
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api";
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "https://ynex3.mycafe24.com/api";
 
 export interface User {
   id: number;
@@ -45,17 +45,54 @@ export interface Dashboard {
   recent_logs: { user_name: string; status: string; sent_at: string }[];
 }
 
+// === Auth ===
+
+export function getToken(): string | null {
+  if (typeof window === "undefined") return null;
+  return localStorage.getItem("payflow_token");
+}
+
+export function setToken(token: string) {
+  localStorage.setItem("payflow_token", token);
+}
+
+export function clearToken() {
+  localStorage.removeItem("payflow_token");
+}
+
 async function request(path: string, options?: RequestInit) {
+  const token = getToken();
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...((options?.headers as Record<string, string>) || {}),
+  };
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`;
+  }
+
   const res = await fetch(`${API_BASE}${path}`, {
     ...options,
-    headers: { "Content-Type": "application/json", ...options?.headers },
+    headers,
   });
+
+  if (res.status === 401 || res.status === 403) {
+    clearToken();
+    window.location.reload();
+    throw new Error("인증이 만료되었습니다. 다시 로그인하세요.");
+  }
+
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
     throw new Error(err.detail || "요청 실패");
   }
   return res.json();
 }
+
+export const auth = {
+  login: (password: string): Promise<{ token: string }> =>
+    request("/auth/login", { method: "POST", body: JSON.stringify({ password }) }),
+  verify: (): Promise<{ valid: boolean }> => request("/auth/verify"),
+};
 
 export const api = {
   getUsers: (): Promise<User[]> => request("/users"),
@@ -94,6 +131,8 @@ export const api = {
   setSendTime: (send_time: string) =>
     request("/settings/send-time", { method: "PUT", body: JSON.stringify({ send_time }) }),
 
-  getExcelUrl: (year: number, month: number) =>
-    `${API_BASE}/export/excel?year=${year}&month=${month}`,
+  getExcelUrl: (year: number, month: number) => {
+    const token = getToken();
+    return `${API_BASE}/export/excel?year=${year}&month=${month}${token ? `&token=${token}` : ""}`;
+  },
 };

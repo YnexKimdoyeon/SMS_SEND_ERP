@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-import { api, User, Payment, Dashboard, SmsLogEntry } from "./api";
+import { api, auth, getToken, setToken, clearToken, User, Payment, Dashboard, SmsLogEntry } from "./api";
 
 const DEFAULT_TEMPLATE =
   "[입금 안내] {이름}님, {입금일} 입금 예정일입니다. 금액: {금액}원{메모}";
@@ -126,8 +126,99 @@ function StatCard({ label, value, sub, color }: { label: string; value: string; 
 
 type Tab = "dashboard" | "calendar" | "users" | "logs" | "settings";
 
+// === Login Screen ===
+function LoginScreen({ onLogin }: { onLogin: () => void }) {
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  const handleLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!password) return;
+    setLoading(true);
+    setError("");
+    try {
+      const res = await auth.login(password);
+      setToken(res.token);
+      onLogin();
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "로그인 실패");
+    }
+    setLoading(false);
+  };
+
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-slate-900 via-indigo-950 to-slate-900">
+      <div className="bg-white/10 backdrop-blur-xl rounded-3xl p-8 w-full max-w-sm border border-white/20 shadow-2xl">
+        <div className="flex items-center gap-3 mb-8">
+          <div className="w-10 h-10 bg-indigo-500 rounded-xl flex items-center justify-center font-bold text-white text-lg">P</div>
+          <span className="font-bold text-2xl text-white tracking-tight">PayFlow</span>
+        </div>
+
+        <form onSubmit={handleLogin} className="space-y-4">
+          <div>
+            <label className="text-xs font-semibold text-slate-300 uppercase tracking-wider">비밀번호</label>
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder="비밀번호를 입력하세요"
+              autoFocus
+              className="mt-2 w-full bg-white/10 border border-white/20 rounded-xl px-4 py-3 text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+            />
+          </div>
+
+          {error && (
+            <div className="bg-rose-500/20 border border-rose-500/30 rounded-xl px-4 py-2.5 text-sm text-rose-300">
+              {error}
+            </div>
+          )}
+
+          <button
+            type="submit"
+            disabled={loading || !password}
+            className="w-full bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-semibold rounded-xl px-4 py-3 transition-colors"
+          >
+            {loading ? "로그인 중..." : "로그인"}
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+}
+
 // === Main ===
 export default function Home() {
+  const [isAuthenticated, setIsAuthenticated] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    const token = getToken();
+    if (!token) {
+      setIsAuthenticated(false);
+      return;
+    }
+    auth.verify().then(() => setIsAuthenticated(true)).catch(() => {
+      clearToken();
+      setIsAuthenticated(false);
+    });
+  }, []);
+
+  if (isAuthenticated === null) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-slate-900 via-indigo-950 to-slate-900">
+        <div className="text-white text-lg">로딩 중...</div>
+      </div>
+    );
+  }
+
+  if (!isAuthenticated) {
+    return <LoginScreen onLogin={() => setIsAuthenticated(true)} />;
+  }
+
+  return <AppMain onLogout={() => { clearToken(); setIsAuthenticated(false); }} />;
+}
+
+function AppMain({ onLogout }: { onLogout: () => void }) {
   const [users, setUsers] = useState<User[]>([]);
   const [payments, setPayments] = useState<Payment[]>([]);
   const [year, setYear] = useState(new Date().getFullYear());
@@ -277,12 +368,21 @@ export default function Home() {
           ))}
         </nav>
 
-        <button
-          onClick={() => setSidebarOpen(!sidebarOpen)}
-          className="p-4 text-slate-500 hover:text-slate-300 text-xs border-t border-slate-700/50"
-        >
-          {sidebarOpen ? "<<  접기" : ">>"}
-        </button>
+        <div className="border-t border-slate-700/50">
+          <button
+            onClick={onLogout}
+            className="w-full p-3 text-rose-400 hover:text-rose-300 hover:bg-slate-800 text-xs font-medium transition-colors flex items-center gap-2 justify-center"
+          >
+            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" /></svg>
+            {sidebarOpen && "로그아웃"}
+          </button>
+          <button
+            onClick={() => setSidebarOpen(!sidebarOpen)}
+            className="w-full p-3 text-slate-500 hover:text-slate-300 text-xs"
+          >
+            {sidebarOpen ? "<<  접기" : ">>"}
+          </button>
+        </div>
       </aside>
 
       {/* === Main Content === */}

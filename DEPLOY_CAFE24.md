@@ -1,400 +1,605 @@
-================================================================================
-        원설 문자 발송 시스템 - Ubuntu 서버 배포 가이드 (HTTPS)
-================================================================================
+# 카페24 우분투 서버 배포 가이드
 
-도메인: https://ynex3.mycafe24.com
-서버: Cafe24 Ubuntu (EASY B: 2CPU, 4GB RAM)
+> 도메인: `https://ynex3.mycafe24.com`
 
-================================================================================
-[1] 서버 초기 설정
-================================================================================
+## 목차
+1. [서버 접속](#1-서버-접속)
+2. [기본 환경 설정](#2-기본-환경-설정)
+3. [프로젝트 업로드](#3-프로젝트-업로드)
+4. [백엔드 설치 및 실행](#4-백엔드-설치-및-실행)
+5. [프론트엔드 빌드 및 배포](#5-프론트엔드-빌드-및-배포)
+6. [Nginx 설치 및 설정](#6-nginx-설치-및-설정)
+7. [SSL 인증서 설정](#7-ssl-인증서-설정)
+8. [서버 자동 시작 설정](#8-서버-자동-시작-설정)
+9. [서버 관리 명령어](#9-서버-관리-명령어)
+10. [문제 해결](#10-문제-해결)
 
-# 1-1. SSH 접속
-ssh root@서버IP주소
+---
 
-# 1-2. 시스템 업데이트
+## 1. 서버 접속
+
+```bash
+# SSH로 카페24 서버 접속
+ssh root@ynex3.mycafe24.com
+
+# 포트가 다른 경우
+ssh -p 2222 root@ynex3.mycafe24.com
+```
+
+> 카페24 호스팅 관리 페이지 → SSH 설정에서 접속 정보를 확인하세요.
+
+---
+
+## 2. 기본 환경 설정
+
+### 2-1. 시스템 패키지 업데이트
+
+```bash
 sudo apt update && sudo apt upgrade -y
+```
 
-# 1-3. 필수 패키지 설치
-sudo apt install -y curl wget git build-essential software-properties-common
+### 2-2. Python 설치
 
-# 1-4. 방화벽 설정
-sudo ufw allow OpenSSH
-sudo ufw allow 80
-sudo ufw allow 443
-sudo ufw enable
-sudo ufw status
+```bash
+# 버전 확인
+python3 --version
 
-# 1-5. 타임존 설정 (한국)
-sudo timedatectl set-timezone Asia/Seoul
+# 3.8 미만이거나 없으면 설치
+sudo apt install -y python3 python3-pip python3-venv
+```
 
+### 2-3. Node.js 설치 (서버에서 프론트엔드 빌드하는 경우)
 
-================================================================================
-[2] Node.js 설치 (프론트엔드용)
-================================================================================
+> 로컬 PC에서 빌드 후 업로드하는 경우 이 단계는 건너뛰세요.
+
+```bash
+# nvm 설치
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
+source ~/.bashrc
 
 # Node.js 20 LTS 설치
-curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-sudo apt install -y nodejs
+nvm install 20
+nvm use 20
+node --version   # v20.x.x 확인
+```
 
-# 버전 확인
-node -v
-npm -v
+### 2-4. Nginx 설치
 
-# PM2 설치 (프로세스 매니저)
-sudo npm install -g pm2
-
-
-================================================================================
-[3] Python 설치 (백엔드용)
-================================================================================
-
-# Python 3.11 설치
-sudo add-apt-repository ppa:deadsnakes/ppa -y
-sudo apt update
-sudo apt install -y python3.11 python3.11-venv python3.11-dev python3-pip
-
-# 기본 Python 설정
-sudo update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
-
-# pip 업그레이드
-python3 -m pip install --upgrade pip
-
-
-================================================================================
-[4] Nginx 설치 (웹서버 & 리버스 프록시)
-================================================================================
-
+```bash
 sudo apt install -y nginx
+
+# 설치 확인
+nginx -v
+
+# 부팅 시 자동 시작 등록
 sudo systemctl enable nginx
-sudo systemctl start nginx
+```
+
+### 2-5. 디렉토리 구조 생성
+
+```bash
+mkdir -p ~/apps/payflow        # 프로젝트 루트
+mkdir -p ~/apps/data           # DB 저장 (웹 접근 불가 경로)
+mkdir -p ~/apps/data/backup    # DB 백업
+mkdir -p ~/logs                # 로그
+```
+
+최종 디렉토리 구조:
+```
+~/                          ← /root
+├── apps/
+│   ├── payflow/
+│   │   ├── backend/       ← FastAPI 백엔드
+│   │   └── frontend/      ← Next.js 소스 (빌드용)
+│   └── data/
+│       ├── payment.db     ← SQLite DB
+│       └── backup/        ← DB 백업
+├── logs/
+│   └── backend.log        ← 백엔드 로그
+
+/var/www/payflow/           ← 프론트엔드 빌드 결과물 (웹 루트)
+```
+
+---
+
+## 3. 프로젝트 업로드
 
 
-================================================================================
-[5] 프로젝트 폴더 생성 및 코드 업로드
-================================================================================
 
-# 프로젝트 폴더 생성
-sudo mkdir -p /var/www/payment-sms
-sudo chown -R $USER:$USER /var/www/payment-sms
+### 4-1. 가상환경 생성 및 패키지 설치
 
-# 로컬에서 파일 업로드 (로컬 PC에서 실행)
-# scp -r /path/to/원설문자프로젝트/* root@서버IP:/var/www/payment-sms/
+```bash
+cd ~/apps/payflow/backend
 
-# 또는 Git 사용
-cd /var/www/payment-sms
-git clone [your-repo-url] .
-
-
-================================================================================
-[6] 백엔드 설정 (FastAPI)
-================================================================================
-
-# 백엔드 폴더로 이동
-cd /var/www/payment-sms/backend
-
-# 가상환경 생성 및 활성화
+# 가상환경 생성
 python3 -m venv venv
+
+# 활성화
 source venv/bin/activate
 
-# 의존성 설치
+# 패키지 설치
+pip install --upgrade pip
 pip install -r requirements.txt
-pip install openpyxl
+```
 
-# .env 파일 생성
-cat > .env << 'EOF'
-ALIGO_API_KEY=여기에_알리고_API_키
-ALIGO_USER_ID=여기에_알리고_유저ID
-ALIGO_SENDER=여기에_발신번호
-EOF
+### 4-2. 환경 변수 설정
 
-# 테스트 실행
-python -m uvicorn main:app --host 0.0.0.0 --port 8000
+```bash
+cp .env.example .env
+nano .env
+```
 
-# 정상 작동하면 Ctrl+C로 종료
+아래 값들을 **반드시** 수정하세요:
 
+```env
+# === 필수 설정 (반드시 변경!) ===
+ADMIN_PASSWORD=여기에10자이상비밀번호입력
+JWT_SECRET_KEY=여기에32자이상랜덤문자열
 
-================================================================================
-[7] 프론트엔드 설정 (Next.js)
-================================================================================
+# === 알리고 SMS API ===
+ALIGO_API_KEY=실제_API_키
+ALIGO_USER_ID=실제_유저_ID
+ALIGO_SENDER=실제_발신번호
 
-# 프론트엔드 폴더로 이동
-cd /var/www/payment-sms/frontend
+# === 보안 설정 ===
+ALLOWED_ORIGINS=https://ynex3.mycafe24.com
+ALLOWED_HOSTS=ynex3.mycafe24.com
 
-# .env.local 생성 (HTTPS)
-cat > .env.local << 'EOF'
-NEXT_PUBLIC_API_URL=https://ynex3.mycafe24.com/api
-EOF
+# === DB 경로 (웹에서 접근 불가능한 경로) ===
+DATABASE_URL=sqlite:////root/apps/data/payment.db
+```
 
-# 의존성 설치
+JWT_SECRET_KEY 생성:
+
+```bash
+python3 -c "import secrets; print(secrets.token_hex(32))"
+# 출력된 값을 .env의 JWT_SECRET_KEY에 붙여넣기
+```
+
+### 4-3. 실행 스크립트 권한 부여
+
+```bash
+chmod +x start.sh stop.sh
+```
+
+### 4-4. 서버 시작 및 확인
+
+```bash
+bash start.sh
+
+# 정상 동작 확인
+curl http://127.0.0.1:8000/api/health
+# {"status":"ok"} 이면 성공!
+```
+
+---
+
+## 5. 프론트엔드 빌드 및 배포
+
+### 방법 A: 로컬 PC에서 빌드 후 업로드 (권장)
+
+```bash
+cd frontend
+
 npm install
-
-# 프로덕션 빌드
 npm run build
 
+# out/ 폴더 생성됨 → 서버에 업로드
+scp -r out/* root@ynex3.mycafe24.com:/var/www/payflow/
+```
 
-================================================================================
-[8] SSL 인증서 설치 (Let's Encrypt)
-================================================================================
+### 방법 B: 서버에서 직접 빌드
 
-# Certbot 설치
-sudo apt install -y certbot python3-certbot-nginx
+```bash
+cd ~/apps/payflow/frontend
 
-# SSL 인증서 발급 (도메인이 서버 IP를 가리키고 있어야 함)
-sudo certbot --nginx -d ynex3.mycafe24.com
+npm install
+npm run build
 
-# 이메일 입력, 약관 동의(Y), 뉴스레터(N)
+# 빌드 결과물을 웹 루트로 복사
+cp -r out/* /var/www/payflow/
+```
 
-# 자동 갱신 테스트
-sudo certbot renew --dry-run
+### 배포 확인
 
+```bash
+# index.html이 있는지 확인
+ls /var/www/payflow/index.html
+```
 
-================================================================================
-[9] Nginx 설정
-================================================================================
+---
 
-# Nginx 설정 파일 생성
-sudo nano /etc/nginx/sites-available/payment-sms
+## 6. Nginx 설치 및 설정
 
-# 아래 내용 붙여넣기:
---------------------------------------------------------------------------------
+Nginx가 하는 역할:
+- `https://ynex3.mycafe24.com/` → 프론트엔드 정적 파일 제공
+- `https://ynex3.mycafe24.com/api/*` → 백엔드(uvicorn 포트 8000)로 프록시
+
+### 6-1. 기존 기본 설정 비활성화
+
+```bash
+sudo rm -f /etc/nginx/sites-enabled/default
+```
+
+### 6-2. 사이트 설정 파일 생성
+
+```bash
+sudo nano /etc/nginx/sites-available/payflow
+```
+
+아래 내용을 **통째로 복사해서 붙여넣기**:
+
+```nginx
 server {
     listen 80;
     server_name ynex3.mycafe24.com;
-    return 301 https://$server_name$request_uri;
-}
 
-server {
-    listen 443 ssl http2;
-    server_name ynex3.mycafe24.com;
+    # === 프론트엔드 정적 파일 ===
+    root /var/www/payflow;
+    index index.html;
 
-    # SSL 인증서 (certbot이 자동으로 설정함)
-    ssl_certificate /etc/letsencrypt/live/ynex3.mycafe24.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/ynex3.mycafe24.com/privkey.pem;
-    include /etc/letsencrypt/options-ssl-nginx.conf;
-    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+    # === API 요청 → 백엔드로 프록시 ===
+    location /api/ {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
 
-    # 보안 헤더
-    add_header X-Frame-Options "SAMEORIGIN" always;
+        # 타임아웃 설정 (엑셀 다운로드 등 오래 걸리는 요청 대비)
+        proxy_read_timeout 60s;
+        proxy_send_timeout 60s;
+    }
+
+    # === 프론트엔드 라우팅 ===
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # === 보안 헤더 ===
+    add_header X-Frame-Options "DENY" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header X-XSS-Protection "1; mode=block" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
 
-    # 프론트엔드 (Next.js)
-    location / {
-        proxy_pass http://127.0.0.1:3000;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection 'upgrade';
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_cache_bypass $http_upgrade;
+    # === 정적 파일 캐싱 ===
+    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2)$ {
+        expires 30d;
+        add_header Cache-Control "public, immutable";
     }
 
-    # 백엔드 API
-    location /api {
-        proxy_pass http://127.0.0.1:8000/api;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
+    # === DB 파일 접근 차단 ===
+    location ~* \.(db|sqlite|sqlite3)$ {
+        deny all;
+    }
+
+    # === 숨김 파일 접근 차단 ===
+    location ~ /\. {
+        deny all;
     }
 }
---------------------------------------------------------------------------------
+```
 
-# 설정 파일 활성화
-sudo ln -s /etc/nginx/sites-available/payment-sms /etc/nginx/sites-enabled/
+### 6-3. 설정 활성화
 
-# 기본 설정 제거
-sudo rm /etc/nginx/sites-enabled/default
+```bash
+# 심볼릭 링크 생성 (sites-available → sites-enabled)
+sudo ln -s /etc/nginx/sites-available/payflow /etc/nginx/sites-enabled/payflow
 
-# 설정 테스트
+# 설정 문법 검사
+sudo nginx -t
+# "syntax is ok" / "test is successful" 이 나와야 함
+
+# Nginx 재시작
+sudo systemctl restart nginx
+```
+
+### 6-4. 동작 확인
+
+```bash
+# Nginx 상태 확인
+sudo systemctl status nginx
+
+# 프론트엔드 확인
+curl -I http://ynex3.mycafe24.com
+# HTTP/1.1 200 OK 이면 성공
+
+# API 프록시 확인
+curl http://ynex3.mycafe24.com/api/health
+# {"status":"ok"} 이면 성공
+```
+
+### 6-5. 방화벽 설정 (필요한 경우)
+
+```bash
+# HTTP(80), HTTPS(443) 포트 열기
+sudo ufw allow 'Nginx Full'
+sudo ufw enable
+sudo ufw status
+```
+
+---
+
+## 7. SSL 인증서 설정 (HTTPS)
+
+카페24에서 SSL이 자동 제공되지 않는 경우, Let's Encrypt로 무료 인증서를 설치합니다.
+
+### 7-1. Certbot 설치
+
+```bash
+sudo apt install -y certbot python3-certbot-nginx
+```
+
+### 7-2. 인증서 발급 및 Nginx 자동 설정
+
+```bash
+sudo certbot --nginx -d ynex3.mycafe24.com
+```
+
+이메일 입력 → 약관 동의(Y) → 완료되면 자동으로 Nginx에 HTTPS 설정이 추가됩니다.
+
+### 7-3. 자동 갱신 확인
+
+```bash
+# 갱신 테스트
+sudo certbot renew --dry-run
+
+# 자동 갱신은 certbot이 자동으로 cron/systemd timer에 등록합니다
+```
+
+### 7-4. HTTPS 동작 확인
+
+```bash
+curl -I https://ynex3.mycafe24.com
+# HTTP/2 200 이면 성공
+
+curl https://ynex3.mycafe24.com/api/health
+# {"status":"ok"} 이면 성공
+```
+
+---
+
+## 8. 서버 자동 시작 설정
+
+서버가 재부팅되어도 백엔드가 자동으로 실행되도록 설정합니다.
+
+### 방법 A: crontab (간단)
+
+```bash
+crontab -e
+```
+
+맨 아래에 추가:
+
+```
+@reboot cd /root/apps/payflow/backend && bash start.sh
+```
+
+### 방법 B: systemd 서비스 (안정적, 권장)
+
+```bash
+sudo nano /etc/systemd/system/payflow.service
+```
+
+아래 내용 붙여넣기:
+
+```ini
+[Unit]
+Description=PayFlow Backend API
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/apps/payflow/backend
+ExecStart=/root/apps/payflow/backend/venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000 --workers 1
+Restart=always
+RestartSec=5
+StandardOutput=append:/root/logs/backend.log
+StandardError=append:/root/logs/backend.log
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+# 서비스 등록 및 시작
+sudo systemctl daemon-reload
+sudo systemctl enable payflow
+sudo systemctl start payflow
+
+# 상태 확인
+sudo systemctl status payflow
+```
+
+> systemd를 사용하면 프로세스가 죽어도 자동 재시작됩니다. 이 방법을 쓰면 start.sh/stop.sh 대신 `sudo systemctl start/stop/restart payflow`로 관리합니다.
+
+---
+
+## 9. 서버 관리 명령어
+
+### 백엔드 서버
+
+```bash
+# --- start.sh/stop.sh 사용 시 ---
+cd ~/apps/payflow/backend
+bash start.sh              # 시작
+bash stop.sh               # 중지
+bash stop.sh && bash start.sh  # 재시작
+
+# --- systemd 사용 시 ---
+sudo systemctl start payflow     # 시작
+sudo systemctl stop payflow      # 중지
+sudo systemctl restart payflow   # 재시작
+sudo systemctl status payflow    # 상태 확인
+```
+
+### Nginx
+
+```bash
+sudo systemctl restart nginx     # 재시작
+sudo systemctl reload nginx      # 설정만 리로드 (무중단)
+sudo nginx -t                    # 설정 문법 검사
+```
+
+### 로그 확인
+
+```bash
+# 백엔드 로그
+tail -f ~/logs/backend.log
+
+# Nginx 접근 로그
+sudo tail -f /var/log/nginx/access.log
+
+# Nginx 에러 로그
+sudo tail -f /var/log/nginx/error.log
+```
+
+### DB 백업
+
+```bash
+# 수동 백업
+cp ~/apps/data/payment.db ~/apps/data/backup/payment_$(date +%Y%m%d).db
+
+# 자동 백업 설정 (매일 새벽 3시)
+crontab -e
+# 아래 줄 추가:
+0 3 * * * cp /root/apps/data/payment.db /root/apps/data/backup/payment_$(date +\%Y\%m\%d).db
+```
+
+### 프론트엔드 업데이트
+
+로컬 PC에서 빌드 후:
+
+```bash
+scp -r out/* root@ynex3.mycafe24.com:/var/www/payflow/
+```
+
+---
+
+## 10. 문제 해결
+
+### 백엔드가 안 켜질 때
+
+```bash
+# 로그 확인
+cat ~/logs/backend.log
+
+# Python 환경 확인
+cd ~/apps/payflow/backend
+source venv/bin/activate
+python3 -c "import fastapi; print('OK')"
+
+# 포트 충돌 확인
+lsof -i :8000
+
+# .env 파일 확인
+cat .env
+```
+
+### 사이트에 접속이 안 될 때
+
+```bash
+# Nginx 상태
+sudo systemctl status nginx
+
+# Nginx 설정 오류 확인
 sudo nginx -t
 
-# Nginx 재시작
-sudo systemctl restart nginx
+# Nginx 에러 로그
+sudo tail -20 /var/log/nginx/error.log
 
+# 방화벽 확인
+sudo ufw status
+```
 
-================================================================================
-[10] PM2로 앱 실행 (자동 재시작)
-================================================================================
+### API 요청이 안 될 때
 
-# 백엔드 실행 스크립트 생성
-cat > /var/www/payment-sms/backend/start.sh << 'EOF'
-#!/bin/bash
-cd /var/www/payment-sms/backend
-source venv/bin/activate
-exec uvicorn main:app --host 127.0.0.1 --port 8000
-EOF
+```bash
+# 1. 백엔드 자체가 살아있는지 확인
+curl http://127.0.0.1:8000/api/health
 
-chmod +x /var/www/payment-sms/backend/start.sh
+# 2. Nginx를 통해 확인
+curl http://ynex3.mycafe24.com/api/health
 
-# PM2 ecosystem 설정 파일 생성
-cat > /var/www/payment-sms/ecosystem.config.js << 'EOF'
-module.exports = {
-  apps: [
-    {
-      name: 'payment-frontend',
-      cwd: '/var/www/payment-sms/frontend',
-      script: 'npm',
-      args: 'start',
-      env: {
-        NODE_ENV: 'production',
-        PORT: 3000
-      }
-    },
-    {
-      name: 'payment-backend',
-      cwd: '/var/www/payment-sms/backend',
-      script: '/var/www/payment-sms/backend/start.sh',
-      interpreter: '/bin/bash'
-    }
-  ]
-}
-EOF
+# 3. CORS 문제면 .env 확인
+grep ALLOWED ~/apps/payflow/backend/.env
+```
 
-# PM2로 앱 시작
-cd /var/www/payment-sms
-pm2 start ecosystem.config.js
+### SMS 발송 실패
 
-# PM2 상태 확인
-pm2 status
+```bash
+grep -i "sms\|aligo\|error" ~/logs/backend.log | tail -20
+grep ALIGO ~/apps/payflow/backend/.env
+```
 
-# 로그 확인
-pm2 logs
+### DB 관련 문제
 
-# 서버 재부팅 시 자동 시작 설정
-pm2 save
-pm2 startup
-# 출력되는 명령어를 복사해서 실행
+```bash
+# DB 파일 확인
+ls -la ~/apps/data/payment.db
 
+# 권한 문제면
+chmod 755 ~/apps/data/
+chmod 644 ~/apps/data/payment.db
+```
 
-================================================================================
-[11] CORS 설정 변경 (중요!)
-================================================================================
+### Nginx 502 Bad Gateway
 
-# 백엔드 main.py에서 CORS 허용 도메인을 수정해야 합니다.
-# main.py의 allow_origins 부분을 아래와 같이 변경:
+백엔드가 꺼져있으면 502 에러가 납니다.
 
-nano /var/www/payment-sms/backend/main.py
+```bash
+# 백엔드 실행 상태 확인
+curl http://127.0.0.1:8000/api/health
 
-# 변경 전:
-#   allow_origins=["http://localhost:3000"],
-# 변경 후:
-#   allow_origins=[
-#       "http://localhost:3000",
-#       "https://ynex3.mycafe24.com",
-#   ],
+# 꺼져있으면 재시작
+cd ~/apps/payflow/backend && bash start.sh
+# 또는
+sudo systemctl restart payflow
+```
 
-# 변경 후 백엔드 재시작
-pm2 restart payment-backend
+---
 
+## 전체 설치 한눈에 보기
 
-================================================================================
-[12] 최종 확인
-================================================================================
+```bash
+# 1. 시스템 패키지
+sudo apt update && sudo apt install -y python3 python3-pip python3-venv nginx
 
-# 1. 백엔드 API 확인
-curl https://ynex3.mycafe24.com/api/dashboard
+# 2. 디렉토리 생성
+mkdir -p ~/apps/payflow ~/apps/data ~/apps/data/backup ~/logs ~/www
 
-# 2. 브라우저에서 접속
-https://ynex3.mycafe24.com
+# 3. 프로젝트 업로드
+cd ~/apps/payflow
+git clone <repo-url> .
 
-# 3. PM2 상태 확인
-pm2 status
+# 4. 백엔드 설치
+cd backend
+python3 -m venv venv && source venv/bin/activate
+pip install --upgrade pip && pip install -r requirements.txt
+cp .env.example .env && nano .env          # ← 환경변수 수정!
+chmod +x start.sh stop.sh
+bash start.sh
+curl http://127.0.0.1:8000/api/health      # ← 확인
 
-# 4. 로그 확인
-pm2 logs payment-frontend
-pm2 logs payment-backend
+# 5. 프론트엔드 배포
+cp -r ../frontend/out/* /var/www/payflow/
 
+# 6. Nginx 설정
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo nano /etc/nginx/sites-available/payflow   # ← 위 6-2 내용 붙여넣기
+sudo ln -s /etc/nginx/sites-available/payflow /etc/nginx/sites-enabled/payflow
+sudo nginx -t && sudo systemctl restart nginx
 
-================================================================================
-[13] 유용한 명령어
-================================================================================
+# 7. SSL 인증서 (HTTPS)
+sudo apt install -y certbot python3-certbot-nginx
+sudo certbot --nginx -d ynex3.mycafe24.com
 
-# 앱 재시작
-pm2 restart all
+# 8. 자동 시작 등록
+(crontab -l 2>/dev/null; echo "@reboot cd /root/apps/payflow/backend && bash start.sh") | crontab -
 
-# 앱 중지
-pm2 stop all
-
-# 앱 삭제
-pm2 delete all
-
-# 로그 실시간 보기
-pm2 logs --lines 100
-
-# Nginx 재시작
-sudo systemctl restart nginx
-
-# Nginx 로그 확인
-sudo tail -f /var/log/nginx/error.log
-
-# SSL 인증서 수동 갱신
-sudo certbot renew
-
-# 시스템 리소스 확인
-htop
-df -h
-free -h
-
-
-================================================================================
-[14] 문제 해결
-================================================================================
-
-### 502 Bad Gateway
-- PM2가 실행 중인지 확인: pm2 status
-- 백엔드 로그 확인: pm2 logs payment-backend
-- 포트 확인: sudo netstat -tlnp | grep -E '3000|8000'
-
-### SSL 인증서 오류
-- 도메인이 서버 IP를 가리키는지 확인
-- certbot 재실행: sudo certbot --nginx -d ynex3.mycafe24.com
-
-### 문자 발송 실패
-- .env 파일 내용 확인: cat /var/www/payment-sms/backend/.env
-- 백엔드 로그 확인: pm2 logs payment-backend
-
-### 메모리 부족
-- PM2 메모리 확인: pm2 monit
-- 불필요한 프로세스 종료
-
-### npm run build 메모리 부족
-- NODE_OPTIONS=--max_old_space_size=1024 npm run build
-
-### SQLite DB 권한 오류
-- chmod 664 /var/www/payment-sms/backend/payment.db
-- chmod 775 /var/www/payment-sms/backend/
-
-
-================================================================================
-[15] 업데이트 배포
-================================================================================
-
-# 코드 업데이트 후
-cd /var/www/payment-sms
-
-# 프론트엔드 업데이트
-cd frontend
-npm install
-npm run build
-pm2 restart payment-frontend
-
-# 백엔드 업데이트
-cd /var/www/payment-sms/backend
-source venv/bin/activate
-pip install -r requirements.txt
-pm2 restart payment-backend
-
-
-================================================================================
-                              배포 완료!
-================================================================================
-
-접속 URL: https://ynex3.mycafe24.com
-API URL: https://ynex3.mycafe24.com/api
-
-================================================================================
+# 9. 최종 확인
+curl https://ynex3.mycafe24.com/api/health
+```
